@@ -207,6 +207,41 @@ class PostgresStream(SQLStream):
     # JSONB Objects won't be selected without type_conformance_level to ROOT_ONLY
     TYPE_CONFORMANCE_LEVEL = TypeConformanceLevel.ROOT_ONLY
 
+    @property
+    def server_side_cursor_batch_size(self) -> int:
+        """Return the batch size for the server-side cursor."""
+        # Allow configuration from meltano.yml, default to 10000
+        return self.config.get("server_side_cursor_batch_size", 10000)
+
+    def get_records(self, context: dict | None) -> t.Iterable[dict[str, t.Any]]:
+        """Return a generator of row-type dictionary objects.
+
+        This method is overridden to enable server-side cursors.
+        """
+        if not self.replication_key:
+            self.logger.warning(
+                "Fetching data without a replication key may cause memory issues "
+                "for large tables. Consider using a server-side cursor by "
+                "defining a replication key.",
+            )
+            yield from super().get_records(context)
+            return
+
+        with self.connector._connect() as connection:
+            # Use a server-side cursor to fetch data in chunks
+            # The `yield_per` argument in `execution_options` is the key change
+            query = self.build_query()
+            self.logger.info(
+                "Executing query with server-side cursor (batch size: %s)",
+                self.server_side_cursor_batch_size,
+            )
+            result = connection.execution_options(
+                yield_per=self.server_side_cursor_batch_size,
+            ).execute(query)
+
+            for row in result:
+                yield self.post_process(dict(row._mapping), context)
+
     def max_record_count(self) -> int | None:
         """Return the maximum number of records to fetch in a single query."""
         return self.config.get("max_record_count")
